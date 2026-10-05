@@ -38,6 +38,7 @@ use quickwit_proto::search::{
     SortOrder, SortValue, SplitIdAndFooterOffsets, SplitResourceStats, SplitSearchError,
 };
 use quickwit_proto::types::SplitId;
+use quickwit_query::JsonLiteral;
 use quickwit_query::query_ast::{
     BoolQuery, CacheNode, HitSet, PredicateCache, QueryAst, QueryAstTransformer, RangeQuery,
     TermQuery, get_or_compile_cached_fst_regex,
@@ -53,6 +54,7 @@ use tantivy::collector::Collector;
 use tantivy::fastfield::FastFieldReaders;
 use tantivy::index::SegmentId;
 use tantivy::schema::Field;
+use tantivy::time::format_description::well_known::Rfc3339;
 use tantivy::{DateTime, Index, ReloadPolicy, Searcher, TantivyError, Term};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -1218,8 +1220,8 @@ fn normalize_timestamp_range(
     if final_start_timestamp != Bound::Unbounded || final_end_timestamp != Bound::Unbounded {
         let time_range = QueryAst::from(RangeQuery {
             field: timestamp_field.to_string(),
-            lower_bound: final_start_timestamp.map(|bound| bound.into_timestamp_nanos().into()),
-            upper_bound: final_end_timestamp.map(|bound| bound.into_timestamp_nanos().into()),
+            lower_bound: final_start_timestamp.map(timestamp_bound_literal),
+            upper_bound: final_end_timestamp.map(timestamp_bound_literal),
         });
         new_ast = if let QueryAst::Bool(mut bool_query) = new_ast {
             if bool_query.must.is_empty()
@@ -1251,6 +1253,20 @@ fn normalize_timestamp_range(
     search_request.query_ast = serde_json::to_string(&new_ast).unwrap();
     search_request.start_timestamp = None;
     search_request.end_timestamp = None;
+}
+
+/// Converts a timestamp bound into the literal of the range query that replaces the
+/// timestamp filters.
+///
+/// The literal is an RFC 3339 string, not a number of nanoseconds: numbers are read by
+/// `parse_timestamp`, which infers their unit from their magnitude and therefore only accepts
+/// timestamps from 1972 to 2242. A nanosecond bound before 1972 would make the range invalid.
+fn timestamp_bound_literal(timestamp: DateTime) -> JsonLiteral {
+    let timestamp_rfc3339 = timestamp
+        .into_utc()
+        .format(&Rfc3339)
+        .expect("a `DateTime` (1677 to 2262) should be representable in RFC 3339");
+    JsonLiteral::String(timestamp_rfc3339)
 }
 
 /// Remove all `must` and `filter timestamp ranges, and summarize them
@@ -2490,7 +2506,6 @@ mod tests {
 
     #[test]
     fn test_normalize_timestamp_range_clips_to_split_and_preserves_bound_types() {
-        const S_TO_NS: i64 = 1_000_000_000;
         let time1 = 1_700_001_000;
         let time2 = 1_700_002_000;
         let time3 = 1_700_003_000;
@@ -2532,7 +2547,9 @@ mod tests {
                 RangeQuery {
                     field: "timestamp".to_string(),
                     lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Included((time3 * S_TO_NS).into()),
+                    upper_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time3),
+                    )),
                 },
             ),
             (
@@ -2540,15 +2557,21 @@ mod tests {
                 RangeQuery {
                     field: "timestamp".to_string(),
                     lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Excluded((time3 * S_TO_NS).into()),
+                    upper_bound: Bound::Excluded(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time3),
+                    )),
                 },
             ),
             (
                 timestamp_range(Bound::Excluded(time2), Bound::Included(time3)),
                 RangeQuery {
                     field: "timestamp".to_string(),
-                    lower_bound: Bound::Excluded((time2 * S_TO_NS).into()),
-                    upper_bound: Bound::Included((time3 * S_TO_NS).into()),
+                    lower_bound: Bound::Excluded(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time2),
+                    )),
+                    upper_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time3),
+                    )),
                 },
             ),
         ] {
@@ -2574,14 +2597,56 @@ mod tests {
             Some(RangeQuery {
                 field: "timestamp".to_string(),
                 lower_bound: Bound::Unbounded,
-                upper_bound: Bound::Excluded((time3 * S_TO_NS).into()),
+                upper_bound: Bound::Excluded(timestamp_bound_literal(
+                    DateTime::from_timestamp_secs(time3),
+                )),
             }),
         );
     }
 
     #[test]
+    fn test_normalize_timestamp_range_before_1972() {
+        // 1896-01-01, 1896-01-11, 1896-01-21 and 1896-01-31 (UTC).
+        let time1 = -2_335_219_200;
+        let time2 = -2_334_355_200;
+        let time3 = -2_333_491_200;
+        let time4 = -2_332_627_200;
+        let split = SplitIdAndFooterOffsets {
+            timestamp_start: Some(time1),
+            timestamp_end: Some(time4),
+            ..Default::default()
+        };
+        assert_normalized_timestamp_range(
+            SearchRequest {
+                query_ast: serde_json::to_string(&QueryAst::MatchAll).unwrap(),
+                start_timestamp: Some(time2),
+                end_timestamp: Some(time3),
+                ..Default::default()
+            },
+            &split,
+            Some(RangeQuery {
+                field: "timestamp".to_string(),
+                lower_bound: Bound::Included(JsonLiteral::String(
+                    "1896-01-11T00:00:00Z".to_string(),
+                )),
+                upper_bound: Bound::Excluded(JsonLiteral::String(
+                    "1896-01-21T00:00:00Z".to_string(),
+                )),
+            }),
+        );
+        // The bounds read back as the same timestamps.
+        use quickwit_query::InterpretUserInput;
+        for timestamp in [time2, time3] {
+            let date_time = DateTime::from_timestamp_secs(timestamp);
+            assert_eq!(
+                DateTime::interpret_json(&timestamp_bound_literal(date_time)),
+                Some(date_time)
+            );
+        }
+    }
+
+    #[test]
     fn test_normalize_timestamp_range_intersects_request_and_ast_bounds() {
-        const S_TO_NS: i64 = 1_000_000_000;
         let time1 = 1_700_001_000;
         let time2 = 1_700_002_000;
         let time3 = 1_700_003_000;
@@ -2600,7 +2665,9 @@ mod tests {
                 RangeQuery {
                     field: "timestamp".to_string(),
                     lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Excluded((time2 * S_TO_NS).into()),
+                    upper_bound: Bound::Excluded(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time2),
+                    )),
                 },
             ),
             (
@@ -2610,7 +2677,9 @@ mod tests {
                 RangeQuery {
                     field: "timestamp".to_string(),
                     lower_bound: Bound::Unbounded,
-                    upper_bound: Bound::Included((time2 * S_TO_NS).into()),
+                    upper_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time2),
+                    )),
                 },
             ),
             (
@@ -2619,8 +2688,12 @@ mod tests {
                 Some(time4 + 1),
                 RangeQuery {
                     field: "timestamp".to_string(),
-                    lower_bound: Bound::Included((time3 * S_TO_NS).into()),
-                    upper_bound: Bound::Included((time4 * S_TO_NS).into()),
+                    lower_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time3),
+                    )),
+                    upper_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time4),
+                    )),
                 },
             ),
             (
@@ -2629,8 +2702,12 @@ mod tests {
                 Some(time4 + 1),
                 RangeQuery {
                     field: "timestamp".to_string(),
-                    lower_bound: Bound::Included((time3 * S_TO_NS).into()),
-                    upper_bound: Bound::Included((time4 * S_TO_NS).into()),
+                    lower_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time3),
+                    )),
+                    upper_bound: Bound::Included(timestamp_bound_literal(
+                        DateTime::from_timestamp_secs(time4),
+                    )),
                 },
             ),
         ];
@@ -2690,10 +2767,16 @@ mod tests {
             actual_ast,
             QueryAst::from(BoolQuery {
                 must: vec![QueryAst::from(CacheNode::new(original_ast))],
-                filter: vec![timestamp_range(
-                    Bound::Included(1_700_002_000_000_000_000),
-                    Bound::Unbounded,
-                )],
+                filter: vec![
+                    RangeQuery {
+                        field: "timestamp".to_string(),
+                        lower_bound: Bound::Included(timestamp_bound_literal(
+                            DateTime::from_timestamp_secs(1_700_002_000)
+                        )),
+                        upper_bound: Bound::Unbounded,
+                    }
+                    .into()
+                ],
                 ..Default::default()
             })
         );

@@ -25,6 +25,7 @@ use quickwit_proto::search::{
     CountHits, LeafListTermsResponse, ListTermsRequest, SearchRequest, SortByValue, SortField,
     SortOrder, SortValue, TraceId,
 };
+use quickwit_query::JsonLiteral;
 use quickwit_query::query_ast::{
     BoolQuery, HitSet, PredicateCache, QueryAst, RangeQuery, qast_helper, qast_json_helper,
     query_ast_from_user_text,
@@ -425,6 +426,84 @@ async fn test_single_node_filtering() -> anyhow::Result<()> {
         single_node_response.err().map(|err| err.to_string()),
         Some("invalid query: field does not exist: `tag`".to_string())
     );
+    test_sandbox.assert_quit().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_single_node_filtering_before_1972() -> anyhow::Result<()> {
+    let index_id = "single-node-filtering-before-1972";
+    let doc_mapping_yaml = r#"
+            field_mappings:
+              - name: body
+                type: text
+              - name: ts
+                type: datetime
+                input_formats:
+                    - "%Y-%m-%d"
+                fast: true
+            timestamp_field: ts
+            mode: lenient
+        "#;
+    let indexing_settings_json = r#"{}"#;
+    let test_sandbox = TestSandbox::create(
+        index_id,
+        doc_mapping_yaml,
+        indexing_settings_json,
+        &["body"],
+    )
+    .await?;
+
+    // One document a day from 1896-01-01 to 1896-01-30.
+    let mut docs = Vec::new();
+    for day in 1..=30 {
+        let body = format!("info @ t:{day}");
+        docs.push(json!({"body": body, "ts": format!("1896-01-{day:02}")}));
+    }
+    test_sandbox.add_documents(docs).await?;
+
+    let sort_by_ts = vec![SortField {
+        field_name: "ts".to_string(),
+        sort_order: SortOrder::Desc as i32,
+        sort_datetime_format: None,
+    }];
+    // [1896-01-11, 1896-01-21[ as request timestamps.
+    let search_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("info", &["body"]),
+        start_timestamp: Some(-2_334_355_200),
+        end_timestamp: Some(-2_333_491_200),
+        max_hits: 15,
+        sort_fields: sort_by_ts.clone(),
+        ..Default::default()
+    };
+    let single_node_response = single_node_search(
+        search_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(single_node_response.num_hits, 10);
+    assert!(&single_node_response.hits[0].json.contains("t:20"));
+    assert!(&single_node_response.hits[9].json.contains("t:11"));
+
+    // The same range in the query.
+    let search_request = SearchRequest {
+        index_id_patterns: vec![index_id.to_string()],
+        query_ast: qast_json_helper("info AND ts:[1896-01-11 TO 1896-01-20]", &["body"]),
+        max_hits: 15,
+        sort_fields: sort_by_ts,
+        ..Default::default()
+    };
+    let single_node_response = single_node_search(
+        search_request,
+        test_sandbox.metastore(),
+        test_sandbox.storage_resolver(),
+    )
+    .await?;
+    assert_eq!(single_node_response.num_hits, 10);
+    assert!(&single_node_response.hits[0].json.contains("t:20"));
+    assert!(&single_node_response.hits[9].json.contains("t:11"));
     test_sandbox.assert_quit().await;
     Ok(())
 }
@@ -2402,8 +2481,8 @@ fn test_time_bounded_predicate_cache_eligibility_after_split_normalization() {
         partial_bool_query.filter,
         vec![QueryAst::from(RangeQuery {
             field: "ts".to_string(),
-            lower_bound: Bound::Included(120_000_000_000i64.into()),
-            upper_bound: Bound::Excluded(180_000_000_000i64.into()),
+            lower_bound: Bound::Included(JsonLiteral::String("1970-01-01T00:02:00Z".to_string())),
+            upper_bound: Bound::Excluded(JsonLiteral::String("1970-01-01T00:03:00Z".to_string())),
         })]
     );
     let partial_predicate = time_bounded_cached_predicate(&partial_ast, "ts")
