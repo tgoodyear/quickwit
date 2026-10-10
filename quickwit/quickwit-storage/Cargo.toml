@@ -87,6 +87,7 @@ azure = [
   "azure_core/enable_reqwest_rustls",
   "azure_storage/enable_reqwest_rustls",
   "azure_storage_blobs/enable_reqwest_rustls",
+  "dep:reqwest",
 ]
 gcs = ["dep:opendal", "opendal/services-gcs"]
 ci-test = []

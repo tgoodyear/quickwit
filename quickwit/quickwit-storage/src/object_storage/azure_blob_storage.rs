@@ -16,12 +16,14 @@ use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::Duration;
 use std::{fmt, io};
 
 use async_trait::async_trait;
+use azure_core::auth::TokenCredential;
 use azure_core::error::ErrorKind;
-use azure_core::{Pageable, StatusCode};
+use azure_core::{HttpClient, Pageable, StatusCode, TransportOptions};
 use azure_storage::Error as AzureError;
 use azure_storage::prelude::*;
 use azure_storage_blobs::blob::operations::GetBlobResponse;
@@ -52,6 +54,59 @@ use crate::{
     BulkDeleteError, DeleteFailure, MultiPartPolicy, PutPayload, Storage, StorageError,
     StorageErrorKind, StorageFactory, StorageResolverError, StorageResult,
 };
+
+/// Environment variable controlling whether Azure blob storage clients share a single pooled HTTP
+/// client and token credential across the process. Defaults to `true`. Set to `false` to restore
+/// the azure SDK defaults (one unpooled HTTP client and one credential per storage instance).
+const QW_AZURE_POOL_ENV_KEY: &str = "QW_AZURE_POOL";
+
+/// Idle pooled connections are closed after this delay, well below the ~4 minute idle timeout of
+/// Azure load balancers, so we do not reuse connections the server side has already dropped.
+const AZURE_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(50);
+
+static AZURE_POOL_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| quickwit_common::get_bool_from_env(QW_AZURE_POOL_ENV_KEY, true));
+
+/// Process-wide HTTP client shared by all Azure blob storage instances.
+///
+/// `azure_core::new_http_client()` builds a `reqwest` client with `pool_max_idle_per_host(0)`,
+/// which disables connection reuse: every request (including every ranged GET issued by a leaf
+/// search) pays for a new TCP connection and TLS handshake. Since storages are resolved per
+/// search request, we share one pooled client instead.
+static AZURE_HTTP_CLIENT: LazyLock<Option<Arc<dyn HttpClient>>> = LazyLock::new(|| {
+    if !*AZURE_POOL_ENABLED {
+        return None;
+    }
+    match reqwest::Client::builder()
+        .http1_only()
+        .pool_idle_timeout(AZURE_POOL_IDLE_TIMEOUT)
+        .build()
+    {
+        Ok(client) => Some(Arc::new(client)),
+        Err(error) => {
+            warn!(
+                error=%error,
+                "failed to build pooled Azure HTTP client, falling back to the azure SDK default"
+            );
+            None
+        }
+    }
+});
+
+/// Process-wide token credential, so that the OAuth token cache survives across storage
+/// instances.
+static AZURE_TOKEN_CREDENTIAL: OnceLock<Arc<dyn TokenCredential>> = OnceLock::new();
+
+fn azure_token_credential() -> azure_core::Result<Arc<dyn TokenCredential>> {
+    if !*AZURE_POOL_ENABLED {
+        return azure_identity::create_credential();
+    }
+    if let Some(credential) = AZURE_TOKEN_CREDENTIAL.get() {
+        return Ok(credential.clone());
+    }
+    let credential = azure_identity::create_credential()?;
+    Ok(AZURE_TOKEN_CREDENTIAL.get_or_init(|| credential).clone())
+}
 
 /// Azure object storage resolver.
 pub struct AzureBlobStorageFactory {
@@ -103,8 +158,11 @@ impl AzureBlobStorage {
         uri: Uri,
         container_name: String,
     ) -> Self {
-        let container_client = BlobServiceClient::new(storage_account_name, storage_credentials)
-            .container_client(container_name);
+        let mut client_builder = ClientBuilder::new(storage_account_name, storage_credentials);
+        if let Some(http_client) = AZURE_HTTP_CLIENT.as_ref() {
+            client_builder = client_builder.transport(TransportOptions::new(http_client.clone()));
+        }
+        let container_client = client_builder.container_client(container_name);
         Self {
             container_client,
             uri,
@@ -179,7 +237,7 @@ impl AzureBlobStorage {
             azure_storage_config.resolve_access_key()
         {
             StorageCredentials::access_key(storage_account_name.clone(), access_key)
-        } else if let Ok(credential) = azure_identity::create_credential() {
+        } else if let Ok(credential) = azure_token_credential() {
             StorageCredentials::token_credential(credential)
         } else {
             return Err(StorageResolverError::InvalidConfig(
@@ -664,9 +722,26 @@ impl From<AzureErrorWrapper> for StorageError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use quickwit_common::uri::Uri;
 
-    use crate::object_storage::azure_blob_storage::parse_azure_uri;
+    use crate::object_storage::azure_blob_storage::{
+        AZURE_HTTP_CLIENT, AZURE_POOL_ENABLED, azure_token_credential, parse_azure_uri,
+    };
+
+    #[test]
+    fn test_azure_storages_share_http_client_and_credential() {
+        if !*AZURE_POOL_ENABLED {
+            // `QW_AZURE_POOL=false`: each storage builds its own client and credential.
+            assert!(AZURE_HTTP_CLIENT.is_none());
+            return;
+        }
+        assert!(AZURE_HTTP_CLIENT.is_some());
+        let first_credential = azure_token_credential().unwrap();
+        let second_credential = azure_token_credential().unwrap();
+        assert!(Arc::ptr_eq(&first_credential, &second_credential));
+    }
 
     #[test]
     fn test_parse_azure_uri() {
